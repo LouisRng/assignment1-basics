@@ -14,6 +14,7 @@ def find_chunk_boundaries(
     assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
 
     # Get total file size in bytes
+    # os.SEEK_SET, os.SEEK_CUR, os.SEEK_END
     file.seek(0, os.SEEK_END)
     file_size = file.tell()
     file.seek(0)
