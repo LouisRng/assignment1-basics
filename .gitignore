@@ -161,3 +161,8 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+# Project-specific
+tests/
+data/
+result/
