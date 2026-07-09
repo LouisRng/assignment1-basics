@@ -1,4 +1,5 @@
 import torch
+import json
 import numpy as np
 import os
 import numpy.typing as npt
@@ -9,13 +10,18 @@ from tqdm import tqdm
 import time
 import timeit 
 from cs336_basics.dataloader import get_batch, save_checkpoint, load_checkpoint
-from cs336_basics.transformer import TransformerLM, cross_entropy, softmax
-from cs336_basics.optimizer import AdamW, gradient_clipping, lr_schedule 
+from cs336_basics.model import BasicTransformerLM
+from cs336_basics.nn_utils import cross_entropy, softmax, clip_gradient
+from cs336_basics.optimizer import AdamW, lr_schedule  
 from cs336_basics.tokenizer import BPETokenizer
 
 # args 
 def parse_args(): 
     parser = argparse.ArgumentParser()
+    parser.add_argument("--eos_token_id", type=int, default=256) # 256 -> <|endoftext|>
+    parser.add_argument("--train", type=bool, default=False)
+    parser.add_argument("--from_pretrained", type=str, required=False)
+    parser.add_argument("--save_model", type=bool, default=False)
     # 数据集路径
     parser.add_argument("--train_data", type=str, required=False)
     parser.add_argument("--val_data", type=str, required=False)
@@ -93,73 +99,6 @@ def evaluate(model, val_data, batch_size, context_length, device, n_eval_batches
         total_loss += loss.item() 
     model.train()
     return total_loss / n_eval_batches
-     
-@torch.no_grad()
-def decoding(
-    model, 
-    tokenizer, 
-    prompt: str, 
-    max_token_len: int, 
-    temperature: float, 
-    p: float,
-    device,
-    context_length: int
-):
-    model.eval()
-
-    ids = tokenizer.encode(prompt)
-    ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # 输入需要有 batch 维度
-
-    # 尝试找 EOS token id
-    try:
-        eot_id = tokenizer.reversed_vocab[b"<|endoftext|>"]
-    except KeyError:
-        eot_id = None 
-
-    generated_ids = []
-    
-    for _ in range(max_token_len):
-        # 截断到 context_length，生产中是用 KV Cache
-        if ids.shape[1] > context_length:
-            input_ids = ids[:, -context_length:]
-        else:
-            input_ids = ids # (1, s, v)
-            
-        logits = model(input_ids)[0, -1, :]     # (v,)
-        
-        probs = softmax(logits, temperature=temperature, dim=-1)
-        
-        # top-p (nucleus) sampling
-        sorted_probs, sorted_indices = torch.sort(probs, descending=True) 
-        cumulative = torch.cumsum(sorted_probs, dim=-1)
-
-        # 找到第一个 cumulative >= p 的位置，保留到这里
-        # nucleus 包括这个位置（"smallest set such that sum >= p"）
-        # 求第一个满足的下标，nonzero 返回非 0 的坐标
-        # item() 会返回 Number 基类，不能直接用
-        cutoff = (cumulative >= p).nonzero()[0].item()          
-        nucleus_probs = sorted_probs[:cutoff + 1]
-        nucleus_indices = sorted_indices[:cutoff + 1]
-        
-        nucleus_probs= nucleus_probs / nucleus_probs.sum()
-        sampled_pos = torch.multinomial(nucleus_probs, num_samples=1)
-        next_id = nucleus_indices[sampled_pos].item()
-
-        # endoftext 切断
-        if eot_id is not None and next_id == eot_id:
-            break
-        
-        # 不要把生成的 token 转换成 str 再拼回去重新 encode，效率非常低下
-        # 直接把生成的 token 拼回 encode 后的 ids
-        generated_ids.append(next_id)
-        ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1) # (1, s)，沿着 seq_len 维度拼接
-        
-    output_text = tokenizer.decode(generated_ids)
-    print("Prompt:", prompt)
-    print("Generation:", output_text)
-    
-    model.train()
-    return output_text
     
 
 def main():
@@ -176,11 +115,11 @@ def main():
     ckpt_dir = Path("checkpoints") / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    model = TransformerLM(
+    model = BasicTransformerLM(
         vocab_size=args.vocab_size, 
         context_length=args.context_length, 
-        num_layers=args.num_layers, 
         d_model=args.d_model, 
+        num_layers=args.num_layers, 
         num_heads=args.num_heads, 
         d_ff=args.d_ff, 
         rope_theta=args.rope_theta
@@ -201,7 +140,8 @@ def main():
         print(f"Resume from step {start_step}")
 
     
-    model.train()
+    if args.train:
+        model.train()
 
     forward_start = 0
     forward_elapsed = 0
@@ -211,81 +151,102 @@ def main():
     optim_elapsed = 0
    
 
-    for step in range(start_step, args.num_steps):
-        t_step_start = time.time()
-        
-        lr = lr_schedule(step, args.lr_max, args.final_lr, args.warmup_steps, args.cos_steps)
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-
-        if args.bm_mode:
-            print("benchmarking mode ... ")
-            x = torch.from_numpy(
-                np.stack(
-                    [np.random.randint(0, args.vocab_size, args.context_length) for _ in range(args.batch_size)]
-                )
-            ).to(device)
-            y = torch.from_numpy(
-                np.stack(
-                    [np.random.randint(0, args.vocab_size, args.context_length) for _ in range(args.batch_size)]
-                )
-            ).to(device)
-        else:
-            x, y = get_batch(train_data, args.batch_size, args.context_length, device)
-        
-        if args.backward == True and args.warmup < step < args.num_bm + args.warmup:
-            optim_start = timeit.default_timer()
-        
-        if args.backward == True and args.warmup < step < args.num_bm + args.warmup:
-            backward_start = timeit.default_timer()
+    if args.train:
+        for step in range(start_step, args.num_steps):
+            t_step_start = time.time()
             
-        if args.forward == True and args.warmup < step < args.num_bm + args.warmup:
-            forward_start = timeit.default_timer() 
+            lr = lr_schedule(step, args.lr_max, args.final_lr, args.warmup_steps, args.cos_steps)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+
+            if args.bm_mode:
+                print("benchmarking mode ... ")
+                x = torch.from_numpy(
+                    np.stack(
+                        [np.random.randint(0, args.vocab_size, args.context_length) for _ in range(args.batch_size)]
+                    )
+                ).to(device)
+                y = torch.from_numpy(
+                    np.stack(
+                        [np.random.randint(0, args.vocab_size, args.context_length) for _ in range(args.batch_size)]
+                    )
+                ).to(device)
+            else:
+                x, y = get_batch(train_data, args.batch_size, args.context_length, device)
             
-        logits = model(x)
-        
-        if args.forward == True and args.warmup < step < args.num_bm + args.warmup:
-            forward_elapsed += timeit.default_timer() - forward_start
-        
-        loss = cross_entropy(logits, y)
+            if args.backward == True and args.warmup < step < args.num_bm + args.warmup:
+                optim_start = timeit.default_timer()
+            
+            if args.backward == True and args.warmup < step < args.num_bm + args.warmup:
+                backward_start = timeit.default_timer()
+                
+            if args.forward == True and args.warmup < step < args.num_bm + args.warmup:
+                forward_start = timeit.default_timer() 
+                
+            logits = model(x)
+            
+            if args.forward == True and args.warmup < step < args.num_bm + args.warmup:
+                forward_elapsed += timeit.default_timer() - forward_start
+            
+            loss = cross_entropy(logits, y)
 
-        optimizer.zero_grad()
-        loss.backward()
+            optimizer.zero_grad()
+            loss.backward()
+            
+            if args.backward == True and args.warmup < step < args.num_bm + args.warmup:
+                forward_elapsed += timeit.default_timer() - backward_start
+            
+            if args.grad_clip > 0:
+                clip_gradient(model.parameters(), args.grad_clip)
         
-        if args.backward == True and args.warmup < step < args.num_bm + args.warmup:
-            forward_elapsed += timeit.default_timer() - backward_start
-        
-        if args.grad_clip > 0:
-            gradient_clipping(model.parameters(), args.grad_clip)
-    
-        optimizer.step()
-        
-        if args.optim == True and args.warmup < step < args.num_bm + args.warmup:
-            optim_elapsed += timeit.default_timer() - optim_start
+            optimizer.step()
+            
+            if args.optim == True and args.warmup < step < args.num_bm + args.warmup:
+                optim_elapsed += timeit.default_timer() - optim_start
 
-        if step % args.log_interval == 0:
-            elapsed = time.time() - t_step_start
-            tokens_per_sec = args.batch_size * args.context_length / elapsed
-            print(f"step {step:6d}  loss {loss.item():.4f}  lr {lr:.2e}  tok/s {tokens_per_sec:,.0f}")
+            if step % args.log_interval == 0:
+                elapsed = time.time() - t_step_start
+                tokens_per_sec = args.batch_size * args.context_length / elapsed
+                print(f"step {step:6d}  loss {loss.item():.4f}  lr {lr:.2e}  tok/s {tokens_per_sec:,.0f}")
 
-        if step % args.val_interval == 0 and step > 0:
-            val_loss = evaluate(model, val_data, args.batch_size, args.context_length, device, args.n_eval_batches)
-            print(f"steps {step} val loss {val_loss:.4f}")
+            if step % args.val_interval == 0 and step > 0:
+                val_loss = evaluate(model, val_data, args.batch_size, args.context_length, device, args.n_eval_batches)
+                print(f"steps {step} val loss {val_loss:.4f}")
 
-        if step % args.ckpt_interval == 0 and step > 0:
-            ckpt_path = ckpt_dir / f"{step}"
-            save_checkpoint(model, optimizer, step, ckpt_path)
+            if step % args.ckpt_interval == 0 and step > 0:
+                ckpt_path = ckpt_dir / f"{step}"
+                save_checkpoint(model, optimizer, step, ckpt_path)
 
-    if args.forward:
-        print(f"Forward one step costs {forward_elapsed / args.num_bm: .4f} seconds")
-    if args.backward:
-        print(f"Forward and backward without counting optimizer one step costs {backward_elapsed / args.num_bm: .4f} seconds")
-    if args.optim:
-        print(f"Forward and backward with counting optimizer one step costs {optim_elapsed / args.num_bm: .4f} seconds")
+        if args.save_model:
+            model_config = Path("checkpoints/model_config.json")
+            model_weights = Path("checkpoints/model.pt") 
+            model_weights.parent.mkdir(parents=True, exist_ok=True)
+            with open(model_config, "w") as f:
+                json.dump(model.config, f, indent=4)
+            torch.save(model.state_dict(), model_weights)
+            print(f"model config saved to {model_config.resolve()}\nmodel weights saved to {model_weights.resolve()}")
+
+        if args.forward:
+            print(f"Forward one step costs {forward_elapsed / args.num_bm: .4f} seconds")
+        if args.backward:
+            print(f"Forward and backward without counting optimizer one step costs {backward_elapsed / args.num_bm: .4f} seconds")
+        if args.optim:
+            print(f"Forward and backward with counting optimizer one step costs {optim_elapsed / args.num_bm: .4f} seconds")
+            
+    if args.from_pretrained:
+        model.eval()
+        model = model.from_pretrained(args.from_pretrained)
             
     tokenizer = BPETokenizer.from_files(args.vocab_path, args.merges_path)
  
-    decoding(model, tokenizer, args.generate, args.max_token_len, args.temperature, args.p, device=device, context_length=50)
+    if args.generate:
+        print(f"Prompt: {args.generate}")
+        ids = tokenizer.encode(args.generate)
+        ids = torch.tensor(ids, dtype=torch.long)  
+        new_ids = model.generate(ids, args.max_token_len, args.temperature, top_k=None, top_p=args.p, eos_token_id=args.eos_token_id)
+        print(f"new_ids.shape: {new_ids.shape}")
+        generation = tokenizer.decode(new_ids.tolist())
+        print(f"Generation: {generation}")
             
     save_checkpoint(model, optimizer, args.num_steps, ckpt_dir / "final.pt")
 

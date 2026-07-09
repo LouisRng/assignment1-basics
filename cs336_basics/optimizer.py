@@ -1,4 +1,4 @@
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import Optional
 import torch
 import math
@@ -33,7 +33,7 @@ class SGD(torch.optim.Optimizer):
         return loss
 
 class AdamW(torch.optim.Optimizer):
-    def __init__(self, params, betas, weight_decay, lr=1e-3, eps=1e-8): 
+    def __init__(self, params, lr, betas, eps, weight_decay): 
         if lr < 0:
             raise ValueError(f"Invalid learning rate {lr}")            
             
@@ -119,22 +119,5 @@ def lr_schedule(t, lr_max, lr_min, t_w, t_c):
         lr_t = lr_min
 
     return lr_t
-
-def gradient_clipping(params: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
-    eps = 1e-6
-    grads = [p.grad for p in params if p.grad is not None]
-    
-    # norm = torch.linalg.vector_norm(torch.stack([grad for grad in grads], dim=0))
-    
-    # 技巧：先对每个张量算 norm（标量），再 stack 起来算总 norm
-    # 数学上等价于 cat 所有梯度再算 norm，但省显存
-    norm = torch.linalg.vector_norm(
-        torch.stack([torch.linalg.vector_norm(g.detach()) for g in grads])
-    )
-    for grad in grads:
-        if norm >= max_l2_norm:
-            # 先算 coef，防止 norm >> max 时可能产生的溢出 (float16)
-            coef = max_l2_norm / (norm + eps) 
-            grad.mul_(coef)
     
     

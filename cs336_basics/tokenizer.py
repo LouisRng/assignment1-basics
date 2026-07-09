@@ -33,6 +33,7 @@ def find_chunk_boundaries(
 
     mini_chunk_size = 4096
 
+    # 处理边界，而非处理 chunk
     for bi in range(1, len(chunk_boundaries) - 1):
         initial_position = chunk_boundaries[bi]
         file.seek(initial_position)
